@@ -1,0 +1,72 @@
+# Production-shaped stack on one host. For real production run the same image on your
+# orchestrator with managed Postgres/Redis (see docs/DEPLOYMENT.md).
+x-app: &app
+  build: .
+  env_file: .env
+  depends_on:
+    db: {condition: service_healthy}
+    redis: {condition: service_healthy}
+  restart: unless-stopped
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:-kitchenly}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/postgres/init.sh:/docker-entrypoint-initdb.d/init.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    volumes: [redisdata:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 20
+    restart: unless-stopped
+
+  migrate:
+    <<: *app
+    command: ["migrate"]
+    restart: "no"
+
+  web:
+    <<: *app
+    command: ["web"]
+    ports: ["8000:8000"]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+
+  # Live orders get their own workers so a slow CSV import can never delay them.
+  worker-webhook:
+    <<: *app
+    command: ["worker"]
+    environment: {QUEUES: webhook, CELERY_CONCURRENCY: "8"}
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+
+  worker-sync:
+    <<: *app
+    command: ["worker"]
+    environment: {QUEUES: "pull,push,import,default", CELERY_CONCURRENCY: "4"}
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+
+  # Exactly ONE beat instance.
+  beat:
+    <<: *app
+    command: ["beat"]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+
+volumes:
+  pgdata:
+  redisdata:
